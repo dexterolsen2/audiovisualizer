@@ -242,6 +242,10 @@
         disconnectCurrentSource();
         initAudioContext();
         try {
+            // Check if the browser actually supports getDisplayMedia
+            if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+                throw new Error("Screen sharing for internal audio is not supported on mobile browsers.");
+            }
             mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
             sourceNode = audioCtx.createMediaStreamSource(mediaStream);
             sourceNode.connect(analyser);
