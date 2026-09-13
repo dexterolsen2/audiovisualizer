@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Digital Equalizer Visualizer</title>
+    <!-- Importing WebM Muxer for fast offline video rendering -->
+    <script src="https://unpkg.com/webm-muxer/build/webm-muxer.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; background-color: #000; color: #fff; font-family: sans-serif; overflow: hidden; height: 100%; }
+        #ui-container { position: absolute; top: 0; left: 0; width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.7); box-sizing: border-box; z-index: 10; display: flex; flex-direction: column; gap: 10px; }
+        .row { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+        button, select, input { background: #333; color: #fff; border: 1px solid #555; padding: 5px 10px; cursor: pointer; border-radius: 4px; }
+        button:hover { background: #555; }
+        button:disabled { background: #111; color: #555; cursor: not-allowed; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; z-index: 1; }
+        canvas { max-width: 100%; max-height: 100%; background-color: #000; }
+        .hidden { display: none !important; }
+        #status { color: #aaa; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+
+<div id="ui-container">
+    <div class="row">
+        <label>Mode:</label>
+        <select id="mode-select">
+            <option value="live">Live Visualization</option>
+            <option value="file">File Import & Render</option>
+        </select>
+
+        <label>Resolution:</label>
+        <select id="res-select">
+            <option value="720">720p</option>
+            <option value="1080" selected>1080p</option>
+            <option value="1440">1440p</option>
+        </select>
+
+        <span id="status">Waiting for input...</span>
+    </div>
+
+    <!-- Live Controls -->
+    <div id="live-controls" class="row">
+        <button id="btn-mic">Use Microphone</button>
+        <button id="btn-system">Use Internal Audio (Screen Share)</button>
+        <button id="btn-stop-live" disabled>Stop Live</button>
+    </div>
+
+    <!-- File Controls -->
+    <div id="file-controls" class="row hidden">
+        <input type="file" id="audio-files" accept="audio/*" multiple>
+        <button id="btn-play-files" disabled>Preview Files</button>
+        <button id="btn-render-video" disabled>Start Fast Render</button>
+        <button id="btn-stop-render" disabled>Cancel Render</button>
+    </div>
+</div>
+
+<div id="canvas-container">
+    <canvas id="visualizer" width="1920" height="1080"></canvas>
+</div>
+
+<script>
+    const canvas = document.getElementById('visualizer');
+    const ctx = canvas.getContext('2d');
+    
+    const modeSelect = document.getElementById('mode-select');
+    const resSelect = document.getElementById('res-select');
+    const liveControls = document.getElementById('live-controls');
+    const fileControls = document.getElementById('file-controls');
+    const btnMic = document.getElementById('btn-mic');
+    const btnSystem = document.getElementById('btn-system');
+    const btnStopLive = document.getElementById('btn-stop-live');
+    const audioFilesInput = document.getElementById('audio-files');
+    const btnPlayFiles = document.getElementById('btn-play-files');
+    const btnRenderVideo = document.getElementById('btn-render-video');
+    const btnStopRender = document.getElementById('btn-stop-render');
+    const statusText = document.getElementById('status');
+
+    let audioCtx;
+    let analyser;
+    let dataArray;
+    let sourceNode;
+    let mediaStream;
+    let animationId;
+    
+    let fileAudioElement = new Audio();
+    let playlist = [];
+    let currentTrackIndex = 0;
+    
+    let cancelRender = false;
+
+    const cols = 24;
+    const rows = 12;
+
+    // Change Resolution
+    resSelect.addEventListener('change', (e) => {
+        if (e.target.value === '720') {
+            canvas.width = 1280; canvas.height = 720;
+        } else if (e.target.value === '1080') {
+            canvas.width = 1920; canvas.height = 1080;
+        } else if (e.target.value === '1440') {
+            canvas.width = 2560; canvas.height = 1440;
+        }
+        if (dataArray) drawFrame(dataArray); 
+        else drawFrame(new Uint8Array(cols));
+    });
+
+    function getBlockColor(rowIdx, alpha = 1) {
+        const ratio = rowIdx / (rows - 1); 
+        let r, g, b;
+        if (ratio < 0.5) {
+            r = Math.floor(255 * (ratio * 2));
+            g = 255;
+            b = 50;
+        } else {
+            r = 255;
+            g = Math.floor(255 * (1 - (ratio - 0.5) * 2));
+            b = 0;
+        }
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    // Abstracted drawing logic scalable to any resolution matching reference spacing
+    function drawFrame(freqData) {
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const step = Math.max(1, Math.floor((freqData.length * 0.5) / cols));
+        let colHeights = [];
+        for (let i = 0; i < cols; i++) {
+            let sum = 0;
+            for (let j = 0; j < step; j++) {
+                sum += freqData[i * step + j] || 0;
+            }
+            let avg = sum / step;
+            let activeRows = Math.ceil((avg / 255) * rows);
+            colHeights.push(activeRows);
+        }
+
+        ctx.save();
+        // Scale perfectly to chosen resolution based on a 1920x1080 virtual canvas footprint
+        ctx.scale(canvas.width / 1920, canvas.height / 1080);
+        
+        const blockWidth = 64;
+        const blockHeight = 65;
+        const gap = 8;
+        const gridHeight = rows * (blockHeight + gap);
+        
+        // Exact offsets to make it strictly fill 100% of the screen factoring in the skewed floor shift
+        const startX = 175; 
+        const startY = 47; 
+
+        // Main grid
+        for (let c = 0; c < cols; c++) {
+            const activeRows = colHeights[c];
+            for (let r = 0; r < rows; r++) {
+                const x = startX + c * (blockWidth + gap);
+                const y = startY + gridHeight - (r * (blockHeight + gap)) - blockHeight;
+
+                if (r < activeRows) {
+                    ctx.fillStyle = getBlockColor(r, 1);
+                } else {
+                    ctx.fillStyle = 'rgba(20, 20, 20, 0.5)';
+                }
+                ctx.fillRect(x, y, blockWidth, blockHeight);
+            }
+        }
+
+        // Floor Reflection
+        ctx.translate(startX, startY + gridHeight + gap);
+        ctx.transform(1, 0, -0.6, 0.4, 0, 0); // Matches reference skew width offset
+
+        for (let c = 0; c < cols; c++) {
+            const activeRows = colHeights[c];
+            for (let r = 0; r < 4; r++) {
+                const x = c * (blockWidth + gap);
+                const y = r * (blockHeight + gap);
+
+                if (r < activeRows) {
+                    let alpha = 0.5 - (r * 0.12);
+                    if (alpha < 0) alpha = 0;
+                    ctx.fillStyle = getBlockColor(r, alpha);
+                } else {
+                    ctx.fillStyle = 'rgba(20, 20, 20, 0.2)';
+                }
+                ctx.fillRect(x, y, blockWidth, blockHeight);
+            }
+        }
+        ctx.restore();
+    }
+
+    function drawLive() {
+        animationId = requestAnimationFrame(drawLive);
+        if (analyser) {
+            analyser.getByteFrequencyData(dataArray);
+            drawFrame(dataArray);
+        }
+    }
+
+    function initAudioContext() {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 512;
+            analyser.smoothingTimeConstant = 0.8;
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            if (!animationId) drawLive();
+        }
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+    }
+
+    function disconnectCurrentSource() {
+        if (sourceNode) {
+            sourceNode.disconnect();
+            sourceNode = null;
+        }
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(t => t.stop());
+            mediaStream = null;
+        }
+        fileAudioElement.pause();
+    }
+
+    // --- Live Mode Handlers ---
+    btnMic.addEventListener('click', async () => {
+        disconnectCurrentSource();
+        initAudioContext();
+        try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+            sourceNode.connect(analyser);
+            btnStopLive.disabled = false;
+            statusText.innerText = "Listening to Microphone...";
+        } catch (err) {
+            statusText.innerText = "Error accessing mic: " + err.message;
+        }
+    });
+
+    btnSystem.addEventListener('click', async () => {
+        disconnectCurrentSource();
+        initAudioContext();
+        try {
+            mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+            sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+            sourceNode.connect(analyser);
+            analyser.connect(audioCtx.destination); 
+            btnStopLive.disabled = false;
+            statusText.innerText = "Listening to System Audio...";
+        } catch (err) {
+            statusText.innerText = "Error accessing system audio: " + err.message;
+        }
+    });
+
+    btnStopLive.addEventListener('click', () => {
+        disconnectCurrentSource();
+        btnStopLive.disabled = true;
+        statusText.innerText = "Live input stopped.";
+        if (dataArray) dataArray.fill(0); 
+    });
+
+
+    // --- File Mode Handlers (Preview) ---
+    audioFilesInput.addEventListener('change', (e) => {
+        playlist = Array.from(e.target.files);
+        if (playlist.length > 0) {
+            btnPlayFiles.disabled = false;
+            btnRenderVideo.disabled = false;
+            statusText.innerText = `${playlist.length} files loaded.`;
+        }
+    });
+
+    function playNextTrack() {
+        if (currentTrackIndex < playlist.length) {
+            const file = playlist[currentTrackIndex];
+            fileAudioElement.src = URL.createObjectURL(file);
+            fileAudioElement.play();
+            statusText.innerText = `Previewing: ${file.name} (${currentTrackIndex + 1}/${playlist.length})`;
+            currentTrackIndex++;
+        } else {
+            statusText.innerText = "Preview finished.";
+        }
+    }
+
+    fileAudioElement.addEventListener('ended', playNextTrack);
+
+    btnPlayFiles.addEventListener('click', () => {
+        disconnectCurrentSource();
+        initAudioContext();
+        if (!sourceNode || !(sourceNode instanceof MediaElementAudioSourceNode)) {
+             sourceNode = audioCtx.createMediaElementSource(fileAudioElement);
+        }
+        sourceNode.disconnect();
+        sourceNode.connect(analyser);
+        analyser.connect(audioCtx.destination); 
+        currentTrackIndex = 0;
+        playNextTrack();
+    });
+
+    // --- Fast Offline Rendering Handlers ---
+    btnRenderVideo.addEventListener('click', async () => {
+        disconnectCurrentSource();
+        if (animationId) cancelAnimationFrame(animationId);
+        
+        btnRenderVideo.disabled = true;
+        btnPlayFiles.disabled = true;
+        btnStopRender.disabled = false;
+        cancelRender = false;
+        
+        let globalTime = 0;
+
+        try {
+            statusText.innerText = "Initializing Muxer & Encoders...";
+            const muxer = new WebMMuxer.Muxer({
+                target: new WebMMuxer.ArrayBufferTarget(),
+                video: { codec: 'V_VP8', width: canvas.width, height: canvas.height, frameRate: 30 }, 
+                audio: { codec: 'A_OPUS', sampleRate: 48000, numberOfChannels: 2 }
+            });
+
+            const videoEncoder = new VideoEncoder({
+                output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+                error: e => console.error("VideoEncoder error:", e)
+            });
+            
+            // Removed hardwareAcceleration requirement to stop the initialization crashes
+            videoEncoder.configure({
+                codec: 'vp8',
+                width: canvas.width,
+                height: canvas.height,
+                bitrate: 5_000_000
+            });
+
+            const audioEncoder = new AudioEncoder({
+                output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+                error: e => console.error("AudioEncoder error:", e)
+            });
+            audioEncoder.configure({
+                codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 128_000
+            });
+
+            for (let fileIndex = 0; fileIndex < playlist.length; fileIndex++) {
+                if (cancelRender) break;
+                const file = playlist[fileIndex];
+                statusText.innerText = `Rendering ${fileIndex + 1}/${playlist.length}: ${file.name} ...`;
+                
+                const arrayBuffer = await file.arrayBuffer();
+                const tempCtx = new AudioContext({ sampleRate: 48000 });
+                const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+                tempCtx.close();
+
+                // 1. Web Audio Fast-Forward Analyser (Visualizer)
+                const offlineCtx = new OfflineAudioContext(2, audioBuffer.length, audioBuffer.sampleRate);
+                const source = offlineCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                const offlineAnalyser = offlineCtx.createAnalyser();
+                offlineAnalyser.fftSize = 512;
+                offlineAnalyser.smoothingTimeConstant = 0.8;
+                source.connect(offlineAnalyser);
+                offlineAnalyser.connect(offlineCtx.destination);
+                source.start(0);
+
+                const duration = audioBuffer.duration;
+                const fps = 30;
+                const frameTime = 1 / fps;
+                
+                await new Promise((resolve, reject) => {
+                    let i = 0;
+                    
+                    const step = () => {
+                        if (cancelRender) { reject("Cancelled"); return; }
+                        let nextTime = i * frameTime;
+                        
+                        if (nextTime < duration) {
+                            // Added async here so we can await the queue drain
+                            offlineCtx.suspend(nextTime).then(async () => {
+                                let tempArray = new Uint8Array(offlineAnalyser.frequencyBinCount);
+                                offlineAnalyser.getByteFrequencyData(tempArray);
+                                drawFrame(tempArray);
+                                
+                                let timestamp = (globalTime + (i * frameTime)) * 1e6;
+                                let frame = new VideoFrame(canvas, { timestamp });
+                                
+                                try {
+                                    if (videoEncoder.state === 'configured') {
+                                        videoEncoder.encode(frame);
+                                    }
+                                } catch (e) {
+                                    console.error("Frame encode error:", e);
+                                } finally {
+                                    frame.close(); 
+                                }
+                                
+                                // --- CRITICAL FIX: BACKPRESSURE ---
+                                // Pauses the generation loop if the encoder gets backed up, preventing system crashes
+                                while (videoEncoder.encodeQueueSize >= 15 && videoEncoder.state === 'configured') {
+                                    await new Promise(r => setTimeout(r, 5));
+                                }
+                                
+                                i++;
+                                step(); 
+                                offlineCtx.resume();
+                            }).catch(reject);
+                        }
+                    };
+                    
+                    offlineCtx.oncomplete = () => resolve();
+                    step();
+                    offlineCtx.startRendering().catch(reject);
+                });
+
+                if (cancelRender) break;
+
+                // 2. Audio Track Encode Loop
+                const numChannels = audioBuffer.numberOfChannels;
+                const sampleRate = audioBuffer.sampleRate;
+                const length = audioBuffer.length;
+                const chunkSize = sampleRate; 
+
+                for (let offset = 0; offset < length; offset += chunkSize) {
+                    let framesToEncode = Math.min(chunkSize, length - offset);
+                    let chunkData = new Float32Array(framesToEncode * numChannels);
+                    for (let c = 0; c < numChannels; c++) {
+                        chunkData.set(audioBuffer.getChannelData(c).subarray(offset, offset + framesToEncode), c * framesToEncode);
+                    }
+                    let audioData = new AudioData({
+                        format: 'f32-planar',
+                        sampleRate: sampleRate,
+                        numberOfFrames: framesToEncode,
+                        numberOfChannels: numChannels,
+                        timestamp: (globalTime + (offset / sampleRate)) * 1e6,
+                        data: chunkData
+                    });
+                    
+                    try {
+                        if (audioEncoder.state === 'configured') {
+                            audioEncoder.encode(audioData);
+                        }
+                    } finally {
+                        audioData.close();
+                    }
+                    
+                    // --- CRITICAL FIX: AUDIO BACKPRESSURE ---
+                    while (audioEncoder.encodeQueueSize >= 20 && audioEncoder.state === 'configured') {
+                        await new Promise(r => setTimeout(r, 5));
+                    }
+                }
+
+                globalTime += duration;
+            }
+
+            if (!cancelRender) {
+                statusText.innerText = "Finalizing video package...";
+                
+                // Added strict state checks before attempting to flush to prevent InvalidStateError
+                if (videoEncoder.state !== 'closed') await videoEncoder.flush();
+                if (audioEncoder.state !== 'closed') await audioEncoder.flush();
+                
+                muxer.finalize();
+                
+                const { buffer } = muxer.target;
+                const blob = new Blob([buffer], { type: 'video/webm' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                a.download = 'music_visualizer_render.webm';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => { document.body.removeChild(a); window.URL.revokeObjectURL(url); }, 100);
+                statusText.innerText = "Render complete and downloaded.";
+            } else {
+                statusText.innerText = "Render cancelled by user.";
+            }
+            
+        } catch (err) {
+            statusText.innerText = "Render Error: " + err.message;
+            console.error(err);
+        }
+
+        btnRenderVideo.disabled = false;
+        btnPlayFiles.disabled = false;
+        btnStopRender.disabled = true;
+        drawLive(); 
+    });
+
+    btnStopRender.addEventListener('click', () => {
+        cancelRender = true;
+        statusText.innerText = "Cancelling render, please wait a moment...";
+        btnStopRender.disabled = true;
+    });
+
+    // --- Mode Switching ---
+    modeSelect.addEventListener('change', (e) => {
+        disconnectCurrentSource();
+        if (dataArray) { dataArray.fill(0); drawFrame(dataArray); } 
+        if (e.target.value === 'live') {
+            liveControls.classList.remove('hidden');
+            fileControls.classList.add('hidden');
+            statusText.innerText = "Switched to Live Mode.";
+        } else {
+            liveControls.classList.add('hidden');
+            fileControls.classList.remove('hidden');
+            statusText.innerText = "Switched to File Mode.";
+        }
+    });
+
+    // Initial setup draw
+    drawFrame(new Uint8Array(cols));
+
+</script>
+</body>
+</html>
